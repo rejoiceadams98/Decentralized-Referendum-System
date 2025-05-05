@@ -128,3 +128,98 @@
         (ok true)
     )
 )
+
+(define-map user-registration
+    principal 
+    { registration-height: uint }
+)
+
+(define-map delegations
+    principal
+    { delegate: principal }
+)
+
+(define-read-only (get-delegate (voter principal))
+    (get delegate (map-get? delegations voter))
+)
+
+(define-read-only (get-vote-weight (voter principal))
+    (let (
+        (registration (default-to { registration-height: stacks-block-height } 
+            (map-get? user-registration voter)))
+        (blocks-registered (- stacks-block-height (get registration-height registration)))
+    )
+        (+ u1 (/ blocks-registered u1000))
+    )
+)
+
+(define-public (register-for-voting)
+    (begin
+        (map-set user-registration tx-sender { registration-height: stacks-block-height })
+        (ok true)
+    )
+)
+
+;; Modified vote function to include weight
+(define-public (vote-new (proposal-id uint) (choice bool))
+    (let (
+        (proposal (unwrap! (get-proposal proposal-id) ERR-INVALID-PROPOSAL))
+        (delegate (get-delegate tx-sender))
+        (vote-key { proposal-id: proposal-id, voter: tx-sender })
+        (weight (get-vote-weight tx-sender))
+    )
+        (asserts! (or (is-none delegate) (is-eq tx-sender (unwrap! delegate ERR-NOT-AUTHORIZED))) (err u201))
+        (asserts! (is-none (get-vote proposal-id tx-sender)) ERR-ALREADY-VOTED)
+        (asserts! (< stacks-block-height (get end-block proposal)) ERR-PROPOSAL-ENDED)
+        
+        (map-set votes vote-key { choice: choice })
+        (map-set proposals proposal-id
+            (merge proposal 
+                {
+                    yes-votes: (if choice (+ (get yes-votes proposal) weight) (get yes-votes proposal)),
+                    no-votes: (if (not choice) (+ (get no-votes proposal) weight) (get no-votes proposal))
+                }
+            )
+        )
+        (ok true)
+    )
+)
+;; 
+
+(define-map proposal-categories
+    uint
+    (string-ascii 20)
+)
+
+(define-map category-proposals
+    (string-ascii 20)
+    (list 100 uint)
+)
+
+(define-public (create-proposal-new (title (string-ascii 100)) (description (string-ascii 500)) (blocks uint) (category (string-ascii 20)))
+    (let (
+        (new-id (+ (var-get proposal-counter) u1))
+        (current-list (default-to (list) (map-get? category-proposals category)))
+    )
+        (map-set proposals new-id
+            {
+                title: title,
+                description: description,
+                creator: tx-sender,
+                start-block: stacks-block-height,
+                end-block: (+ stacks-block-height blocks),
+                yes-votes: u0,
+                no-votes: u0,
+                status: "active"
+            }
+        )
+        (map-set proposal-categories new-id category)
+        ;; (map-set category-proposals category (append current-list new-id))
+        (var-set proposal-counter new-id)
+        (ok new-id)
+    )
+)
+
+(define-read-only (get-proposals-by-category (category (string-ascii 20)))
+    (default-to (list) (map-get? category-proposals category))
+)
