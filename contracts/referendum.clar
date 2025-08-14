@@ -720,3 +720,325 @@
         (ok true)
     )
 )
+;; Amendment System for Proposal Refinement
+
+;; Amendment-specific error codes
+(define-constant ERR-AMENDMENT-NOT-FOUND (err u111))
+(define-constant ERR-CANNOT-AMEND-ENDED-PROPOSAL (err u112))
+(define-constant ERR-AMENDMENT-ALREADY-VOTED (err u113))
+(define-constant ERR-AMENDMENT-EXPIRED (err u114))
+(define-constant ERR-CANNOT-AMEND-OWN-PROPOSAL (err u115))
+
+;; Amendment counter for unique IDs
+(define-data-var amendment-counter uint u0)
+
+;; Maps to store amendment data
+(define-map proposal-amendments
+    uint ;; proposal-id
+    {
+        amendment-ids: (list 50 uint),
+        active-amendment: (optional uint),
+        amendment-count: uint
+    }
+)
+
+(define-map amendments
+    uint ;; amendment-id
+    {
+        proposal-id: uint,
+        proposer: principal,
+        new-title: (optional (string-ascii 100)),
+        new-description: (optional (string-ascii 500)),
+        duration-extension: (optional uint),
+        created-at: uint,
+        expires-at: uint,
+        yes-votes: uint,
+        no-votes: uint,
+        status: (string-ascii 20) ;; "active", "approved", "rejected", "expired"
+    }
+)
+
+(define-map amendment-votes
+    { amendment-id: uint, voter: principal }
+    { choice: bool, voted-at: uint }
+)
+
+(define-map amendment-approvals
+    { proposal-id: uint, original-creator: principal }
+    { approved-amendments: (list 10 uint) }
+)
+
+;; Read-only functions for amendment data retrieval
+(define-read-only (get-amendment (amendment-id uint))
+    (map-get? amendments amendment-id)
+)
+
+(define-read-only (get-proposal-amendments (proposal-id uint))
+    (default-to
+        {
+            amendment-ids: (list),
+            active-amendment: none,
+            amendment-count: u0
+        }
+        (map-get? proposal-amendments proposal-id)
+    )
+)
+
+(define-read-only (get-amendment-vote (amendment-id uint) (voter principal))
+    (map-get? amendment-votes { amendment-id: amendment-id, voter: voter })
+)
+
+(define-read-only (get-amendment-count)
+    (var-get amendment-counter)
+)
+
+(define-read-only (get-creator-approvals (proposal-id uint) (creator principal))
+    (default-to
+        { approved-amendments: (list) }
+        (map-get? amendment-approvals { proposal-id: proposal-id, original-creator: creator })
+    )
+)
+
+;; Check if amendment is still active and votable
+(define-read-only (is-amendment-active (amendment-id uint))
+    (match (get-amendment amendment-id)
+        amendment (and 
+            (is-eq (get status amendment) "active")
+            (< stacks-block-height (get expires-at amendment))
+        )
+        false
+    )
+)
+
+;; Create a new amendment to an existing proposal
+(define-public (create-amendment 
+    (proposal-id uint)
+    (new-title (optional (string-ascii 100)))
+    (new-description (optional (string-ascii 500)))
+    (duration-extension (optional uint)))
+    (let (
+        (proposal (unwrap! (get-proposal proposal-id) ERR-INVALID-PROPOSAL))
+        (new-amendment-id (+ (var-get amendment-counter) u1))
+        (current-amendments (get-proposal-amendments proposal-id))
+        (amendment-duration u1440) ;; ~1 day in blocks
+    )
+        ;; Validate proposal is still active
+        (asserts! (< stacks-block-height (get end-block proposal)) ERR-PROPOSAL-ENDED)
+        (asserts! (is-eq (get status proposal) "active") ERR-CANNOT-AMEND-ENDED-PROPOSAL)
+        
+        ;; Prevent self-amendment (encourages collaboration)
+        (asserts! (not (is-eq tx-sender (get creator proposal))) ERR-CANNOT-AMEND-OWN-PROPOSAL)
+        
+        ;; Ensure at least one modification is proposed
+        (asserts! (or (is-some new-title) (is-some new-description) (is-some duration-extension)) ERR-INVALID-PROPOSAL)
+        
+        ;; Create the amendment
+        (map-set amendments new-amendment-id
+            {
+                proposal-id: proposal-id,
+                proposer: tx-sender,
+                new-title: new-title,
+                new-description: new-description,
+                duration-extension: duration-extension,
+                created-at: stacks-block-height,
+                expires-at: (+ stacks-block-height amendment-duration),
+                yes-votes: u0,
+                no-votes: u0,
+                status: "active"
+            }
+        )
+        
+        ;; Update proposal amendment tracking
+        (let (
+            (updated-ids (unwrap! (as-max-len? 
+                (append (get amendment-ids current-amendments) new-amendment-id) u50) 
+                ERR-INVALID-PROPOSAL))
+        )
+            (map-set proposal-amendments proposal-id
+                (merge current-amendments
+                    {
+                        amendment-ids: updated-ids,
+                        amendment-count: (+ (get amendment-count current-amendments) u1)
+                    }
+                )
+            )
+        )
+        
+        (var-set amendment-counter new-amendment-id)
+        (ok new-amendment-id)
+    )
+)
+
+;; Vote on an amendment
+(define-public (vote-on-amendment (amendment-id uint) (choice bool))
+    (let (
+        (amendment (unwrap! (get-amendment amendment-id) ERR-AMENDMENT-NOT-FOUND))
+        (vote-key { amendment-id: amendment-id, voter: tx-sender })
+        (voter-weight (get-vote-weight tx-sender))
+    )
+        ;; Validate amendment is active and votable
+        (asserts! (is-amendment-active amendment-id) ERR-AMENDMENT-EXPIRED)
+        (asserts! (is-none (get-amendment-vote amendment-id tx-sender)) ERR-AMENDMENT-ALREADY-VOTED)
+        
+        ;; Record the vote
+        (map-set amendment-votes vote-key 
+            { choice: choice, voted-at: stacks-block-height }
+        )
+        
+        ;; Update vote counts with weight
+        (map-set amendments amendment-id
+            (merge amendment
+                {
+                    yes-votes: (if choice 
+                        (+ (get yes-votes amendment) voter-weight) 
+                        (get yes-votes amendment)),
+                    no-votes: (if (not choice) 
+                        (+ (get no-votes amendment) voter-weight) 
+                        (get no-votes amendment))
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Original proposal creator can directly approve an amendment
+(define-public (approve-amendment (amendment-id uint))
+    (let (
+        (amendment (unwrap! (get-amendment amendment-id) ERR-AMENDMENT-NOT-FOUND))
+        (proposal (unwrap! (get-proposal (get proposal-id amendment)) ERR-INVALID-PROPOSAL))
+        (approval-key { proposal-id: (get proposal-id amendment), original-creator: tx-sender })
+        (current-approvals (get-creator-approvals (get proposal-id amendment) tx-sender))
+    )
+        ;; Only original proposal creator can approve
+        (asserts! (is-eq tx-sender (get creator proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-amendment-active amendment-id) ERR-AMENDMENT-EXPIRED)
+        
+        ;; Mark amendment as approved
+        (map-set amendments amendment-id
+            (merge amendment { status: "approved" })
+        )
+        
+        ;; Track creator approval
+        (let (
+            (updated-approvals (unwrap! (as-max-len? 
+                (append (get approved-amendments current-approvals) amendment-id) u10)
+                ERR-INVALID-PROPOSAL))
+        )
+            (map-set amendment-approvals approval-key
+                { approved-amendments: updated-approvals }
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Finalize amendment voting and apply if successful
+(define-public (finalize-amendment (amendment-id uint))
+    (let (
+        (amendment (unwrap! (get-amendment amendment-id) ERR-AMENDMENT-NOT-FOUND))
+        (proposal (unwrap! (get-proposal (get proposal-id amendment)) ERR-INVALID-PROPOSAL))
+        (total-votes (+ (get yes-votes amendment) (get no-votes amendment)))
+        (approval-threshold (/ (var-get min-votes) u2)) ;; 50% of min votes required
+        (amendment-passed (and 
+            (>= total-votes approval-threshold)
+            (> (get yes-votes amendment) (get no-votes amendment))
+        ))
+    )
+        ;; Can only finalize after amendment period expires or if creator approved
+        (asserts! (or 
+            (>= stacks-block-height (get expires-at amendment))
+            (is-eq (get status amendment) "approved")
+        ) ERR-AMENDMENT-EXPIRED)
+        
+        (if (or amendment-passed (is-eq (get status amendment) "approved"))
+            (begin
+                ;; Apply amendment to original proposal
+                (unwrap! (apply-amendment-to-proposal amendment-id) ERR-INVALID-PROPOSAL)
+                
+                ;; Mark amendment as approved
+                (map-set amendments amendment-id
+                    (merge amendment { status: "approved" })
+                )
+                (ok true)
+            )
+            (begin
+                ;; Mark amendment as rejected
+                (map-set amendments amendment-id
+                    (merge amendment { status: "rejected" })
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+;; Internal function to apply approved amendment to proposal
+(define-private (apply-amendment-to-proposal (amendment-id uint))
+    (let (
+        (amendment (unwrap! (get-amendment amendment-id) ERR-AMENDMENT-NOT-FOUND))
+        (proposal (unwrap! (get-proposal (get proposal-id amendment)) ERR-INVALID-PROPOSAL))
+    )
+        (map-set proposals (get proposal-id amendment)
+            (merge proposal
+                {
+                    title: (default-to (get title proposal) (get new-title amendment)),
+                    description: (default-to (get description proposal) (get new-description amendment)),
+                    end-block: (match (get duration-extension amendment)
+                        extension (+ (get end-block proposal) extension)
+                        (get end-block proposal)
+                    )
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Batch reject expired amendments for cleanup
+(define-public (cleanup-expired-amendments (amendment-ids (list 10 uint)))
+    (begin
+        (map cleanup-single-amendment amendment-ids)
+        (ok true)
+    )
+)
+
+;; Helper function for cleanup
+(define-private (cleanup-single-amendment (amendment-id uint))
+    (match (get-amendment amendment-id)
+        amendment (if (and 
+            (is-eq (get status amendment) "active")
+            (>= stacks-block-height (get expires-at amendment))
+        )
+            (map-set amendments amendment-id
+                (merge amendment { status: "expired" })
+            )
+            true
+        )
+        true
+    )
+)
+
+;; Get amendment voting results summary
+(define-read-only (get-amendment-results (amendment-id uint))
+    (match (get-amendment amendment-id)
+        amendment (let (
+            (total-votes (+ (get yes-votes amendment) (get no-votes amendment)))
+        )
+            (some {
+                amendment-id: amendment-id,
+                proposal-id: (get proposal-id amendment),
+                total-votes: total-votes,
+                yes-percentage: (if (> total-votes u0) 
+                    (/ (* (get yes-votes amendment) u100) total-votes)
+                    u0
+                ),
+                status: (get status amendment),
+                expires-at: (get expires-at amendment)
+            })
+        )
+        none
+    )
+)
+
+
