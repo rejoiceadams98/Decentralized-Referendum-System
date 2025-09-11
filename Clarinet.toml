@@ -9,6 +9,15 @@ requirements = []
 path = 'contracts/referendum.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.VotingAnalytics]
+path = 'contracts/VotingAnalytics.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.ProposalImpactTracker]
+path = 'contracts/ProposalImpactTracker.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
